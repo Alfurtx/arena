@@ -10,27 +10,11 @@
 
 typedef unsigned int uint;
 
-typedef struct Region Region;
-
-struct Region {
-    Region* next;
-    size_t mem_current;
-    size_t mem_total;
-    void* data;
-};
-
-Region region_new(size_t size);
-void region_free(Region* region);
-
 typedef struct Arena {
-    Region* begin;
-    Region* end;
 } Arena;
 
 typedef struct ArenaLocal {
     Arena* arena;
-    Region* region;
-    size_t pos;
 } ArenaLocal;
 
 ArenaLocal arena_get_scratch(Arena* arena);
@@ -42,28 +26,6 @@ void       arena_clear(Arena* arena);
 #endif // ARENA_H
 
 #ifdef ARENA_IMPLEMENTATION
-
-Region*
-region_new(size_t size)
-{
-    Region* result = calloc(sizeof(Region), 1);
-    assert(result);
-    result->data = calloc(size);
-    result->mem_total = size;
-    result->mem_current = 0;
-    result->next = NULL;
-    return result;
-}
-
-void
-region_free(Region* region)
-{
-    assert(region);
-    assert(region->data);
-    free(region->data);
-    region->data = NULL;
-    free(region);
-}
 
 void
 arena_free(Arena* arena) {
