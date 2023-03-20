@@ -14,41 +14,48 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdbool.h>
 
-#define REGION_DEFAULT_CAPACITY (1024 * 8)
+#ifdef _WIN32
+#include <windows.h>
+#include <memoryapi.h>
+#endif
+
+#define Kilobyte(size) (1024LL*size)
+#define Megabyte(size) (1024LL*Kilobyte(size))
+#define Gigabyte(size) (1024LL*Megabyte(size))
+
+#define ARENA_INIT_RESERVE (Gigabyte(16))
+#define ARENA_PAGE_DEFAULT (Megabyte(1))
 
 typedef unsigned int uint;
-
-typedef struct Region Region;
-
-void* memcommit(void* address, size_t size);
-void* memreserve(size_t size);
-
-struct Region {
-    Region* next;
-    size_t mem_current;
-    size_t mem_total;
-    void* data;
-};
-
-Region region_new(size_t size);
-void region_free(Region* region);
+typedef size_t usize;
 
 typedef struct Arena {
-    Region* begin;
-    Region* end;
+    usize used;
+    usize commited;
+    void* base;
+    void* next_page;
+
+    // TODO(fonsi): probably remove this member cause the maximum virtual memory
+    // its just a big upperbound, it is not meant to ever be reached, thus making
+    // this member useless
+    usize total;
 } Arena;
 
-typedef struct ArenaLocal {
+typedef struct ArenaScratch {
     Arena* arena;
-    Region* region;
-    size_t pos;
-} ArenaLocal;
+    usize pos;
+} ArenaScratch;
 
-ArenaLocal arena_get_scratch(Arena* arena);
-void       arena_release_scratch(ArenaLocal* local);
-void       arena_free(Arena* arena);
-void*      arena_push(Arena* arena, size_t size);
+void* memory_reserve(usize size);
+void* memory_commit(void* address, usize size);
+
+ArenaScratch arena_get_scratch(Arena* arena);
+void       arena_release_scratch(ArenaScratch* local);
+Arena      arena_create(void);
+void       arena_release(Arena* arena);
+void*      arena_push(Arena* arena, usize size);
 void       arena_clear(Arena* arena);
 
 #endif // ARENA_H
@@ -56,115 +63,89 @@ void       arena_clear(Arena* arena);
 #ifdef ARENA_IMPLEMENTATION
 
 void*
-memcommit(void* address, size_t size)
+memory_reserve(usize size)
 {
-    void* result = VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE);
-    return result;
+    return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
 }
 
 void*
-memreserve(size_t size)
+memory_commit(void* address, usize size)
 {
-    return VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    return VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE);
 }
 
-Region*
-region_new(size_t size)
+Arena
+arena_create(void)
 {
-    Region* result = calloc(sizeof(Region), 1);
-    assert(result);
-    result->data = calloc(size);
-    result->mem_total = size;
-    result->mem_current = 0;
-    result->next = NULL;
-    return result;
-}
-
-void
-region_free(Region* region)
-{
-    assert(region);
-    assert(region->data);
-    free(region->data);
-    region->data = NULL;
-    free(region);
+    void* tmp = memory_reserve(ARENA_INIT_RESERVE);
+    return (Arena) {
+        .used = 0,
+        .commited = 0,
+        .total = ARENA_INIT_RESERVE,
+        .base = tmp,
+        .next_page = tmp,
+    };
 }
 
 void
-arena_free(Arena* arena) {
-    Region* region = arena->begin;
-    while(region) {
-        Region *r = region;
-        region = region->next;
-        region_free(r);
-    }
-    arena->begin = NULL;
-    arena->end = NULL;
+arena_release(Arena* arena) {
+    assert(arena);
+    VirtualFree(arena->base, 0, MEM_RELEASE);
 }
 
 void
 arena_clear(Arena* arena) {
-    Region* r = arena->begin;
-    while(r != NULL) {
-        r->mem_current = 0;
-        r = r->next;
-    }
-    arena->end = arena->begin;
+    assert(arena);
+    arena->used = 0;
 }
 
 void*
-arena_push(Arena* arena, size_t size)
+arena_push(Arena* arena, usize size)
 {
-    if(!arena->end) {
-        assert(!arena->begin);
-        size_t cap = REGION_DEFAULT_CAPACITY;
-        if(cap < size) cap = size;
-        arena->end = region_new(cap);
-        arena->begin = end;
+    // commit more memory if it is necessary
+    if(arena->used + size >= arena->commited) {
+        usize next_page = ARENA_PAGE_DEFAULT;
+        // i suppose that this is application dependent and can become a problem
+        // but i'll leave it for future fonsi
+        if(next_page < size) next_page = size;
+        memory_commit(arena->next_page, next_page);
+        arena->next_page = ((char*) arena->next_page) + next_page;
+        arena->commited += next_page;
     }
 
-    while(arena->end->mem_current + size > arena->end->mem_total && arena->end->next != NULL)
-        arena->end = arena->end->next;
+    void* result = ((char*) arena->base) + arena->used;
+    arena->used += size;
 
-    if(arena->end->mem_current + size > arena->end->mem_total) {
-        assert(arena->end->next == NULL);
-        size_t cap = REGION_DEFAULT_CAPACITY;
-        if(cap < size) cap = size;
-        arena->end->next = region_new(cap);
-        arena->end = arena->end->next;
-    }
-
-    void* result = arena->end->data + arena->end->mem_current;
-    arena->end->mem_current += size;
     return result;
 }
 
-ArenaLocal
+ArenaScratch
 arena_get_scratch(Arena* arena)
 {
     assert(arena);
-    ArenaLocal result;
-    result.arena = arena;
-    result.region = arena->end;
-    result.pos = arena->end->mem_current;
-}
-
-static void
-recursive_region_release(Region* r)
-{
-    if(r == NULL) return;
-    recursive_region_release(r->next);
-    if(r->next == NULL) {
-        region_free(r);
-        r = NULL;
-    }
+    return (ArenaScratch) {
+        .arena = arena,
+        .pos = arena->used,
+    };
 }
 
 void
-arena_release_scratch(ArenaLocal* local)
+arena_release_scratch(ArenaScratch* local)
 {
     assert(local);
-    local->arena->end = local->region;
-    local->arena->end->mem_current = local->pos;
-    recursive_region_release(local->arena->end->next);
+    local->arena->used = local->pos;
 }
+
+void
+arena_print(Arena* arena)
+{
+    printf("Arena {\n");
+    printf("used:      %zu\n", arena->used);
+    printf("commited:  %zu\n", arena->commited);
+    printf("total:     %zu\n", arena->total);
+    printf("base:      %p\n", arena->base);
+    printf("next_page: %p\n", arena->next_page);
+    printf("}\n");
+}
+
+#endif
