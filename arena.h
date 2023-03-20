@@ -1,6 +1,15 @@
 #ifndef ARENA_H
 #define ARENA_H
 
+#ifndef _WIN32
+#error "TODO(fonsi): Other arena backends than WIN32 not implemented yet"
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+#include <memoryapi.h>
+#endif // _WIN32
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +20,9 @@
 typedef unsigned int uint;
 
 typedef struct Region Region;
+
+void* memcommit(void* address, size_t size);
+void* memreserve(size_t size);
 
 struct Region {
     Region* next;
@@ -42,6 +54,19 @@ void       arena_clear(Arena* arena);
 #endif // ARENA_H
 
 #ifdef ARENA_IMPLEMENTATION
+
+void*
+memcommit(void* address, size_t size)
+{
+    void* result = VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE);
+    return result;
+}
+
+void*
+memreserve(size_t size)
+{
+    return VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+}
 
 Region*
 region_new(size_t size)
